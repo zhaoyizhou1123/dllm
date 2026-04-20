@@ -139,3 +139,5 @@ dmypy.json
 /.models/
 
 .claude/
+checkpoints/
+results/
