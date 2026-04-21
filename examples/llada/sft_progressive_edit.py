@@ -285,6 +285,7 @@ def train():
         num_warmup_steps=training_args.warmup_steps,
         num_training_steps=total_steps,
     )
+    lr_scheduler = accelerator.prepare(lr_scheduler)
 
     # ---- Pool ----------------------------------------------------------------
     # Pool is per-process; each rank maintains its own pool fed by its shard of
@@ -453,7 +454,8 @@ def train():
                             if training_args.save_total_limit > 0:
                                 ckpts = sorted(
                                     [d for d in os.listdir(training_args.output_dir)
-                                     if d.startswith("step_") and os.path.isdir(
+                                     if d.startswith("step_") and d[5:].isdigit()
+                                     and os.path.isdir(
                                          os.path.join(training_args.output_dir, d))],
                                     key=lambda x: int(x[5:]),
                                 )

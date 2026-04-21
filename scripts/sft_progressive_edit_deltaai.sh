@@ -73,5 +73,5 @@ srun --nodes=1 --ntasks=1 \
       --eval_steps 500 \
       --save_steps 500 \
       --save_total_limit 2 \
-      --resume_from_checkpoint "$OUTPUT_DIR/step_500" \
+      --resume_from_checkpoint "$OUTPUT_DIR/step_4000" \
       --report_to wandb

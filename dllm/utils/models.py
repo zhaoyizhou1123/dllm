@@ -79,6 +79,12 @@ def get_model(
     return model
 
 
+def _is_bert_model(model_cls) -> bool:
+    """Check if model_cls is a BERT/RoBERTa/ModernBERT model, importing only when needed."""
+    from transformers import BertPreTrainedModel, ModernBertPreTrainedModel, RobertaPreTrainedModel
+    return issubclass(model_cls, (BertPreTrainedModel, RobertaPreTrainedModel, ModernBertPreTrainedModel))
+
+
 def get_tokenizer(
     model_args: ModelArguments | None = None, **kwargs
 ) -> transformers.PreTrainedTokenizer:
@@ -93,12 +99,6 @@ def get_tokenizer(
         transformers.PreTrainedTokenizer
     """
     # Lazy imports to avoid circular dependencies
-    from transformers import (
-        BertPreTrainedModel,
-        ModernBertPreTrainedModel,
-        RobertaPreTrainedModel,
-    )
-
     from dllm.pipelines.a2d import (
         A2DLlamaLMHeadModel,
         A2DQwen2LMHeadModel,
@@ -168,10 +168,7 @@ def get_tokenizer(
     elif issubclass(model_cls, DreamModel):
         tokenizer.eot_token = "<|im_end|>"
         tokenizer.eot_token_id = tokenizer.convert_tokens_to_ids(tokenizer.eot_token)
-    elif issubclass(
-        model_cls,
-        (BertPreTrainedModel, RobertaPreTrainedModel, ModernBertPreTrainedModel),
-    ):
+    elif _is_bert_model(model_cls):
         tokenizer.eot_token = "[/Answer]"
         tokenizer.chat_template = """\
 {% if messages[0]['role'] == 'system' %}

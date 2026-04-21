@@ -240,7 +240,7 @@ def train():
         shuffle=False,
         num_workers=training_args.dataloader_num_workers,
         pin_memory=False,
-        drop_last=False,
+        drop_last=True,
     )
 
     # ---- Optimizer & scheduler -----------------------------------------------
@@ -250,6 +250,13 @@ def train():
         weight_decay=training_args.weight_decay,
         betas=(training_args.adam_beta1, training_args.adam_beta2),
         fused=torch.cuda.is_available(),
+    )
+
+    # ---- Accelerate prepare --------------------------------------------------
+    # Prepare model, optimizer, and data loaders first so that len(train_loader)
+    # reflects the DistributedSampler split (per-GPU batch count).
+    model, optimizer, train_loader, val_loader = accelerator.prepare(
+        model, optimizer, train_loader, val_loader
     )
 
     steps_per_epoch = math.ceil(len(train_loader) / training_args.gradient_accumulation_steps)
@@ -263,11 +270,7 @@ def train():
         num_warmup_steps=training_args.warmup_steps,
         num_training_steps=total_steps,
     )
-
-    # ---- Accelerate prepare --------------------------------------------------
-    model, optimizer, train_loader, val_loader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_loader, val_loader, lr_scheduler
-    )
+    lr_scheduler = accelerator.prepare(lr_scheduler)
 
     # ---- WandB init ----------------------------------------------------------
     if accelerator.is_main_process and training_args.report_to == "wandb":
@@ -402,7 +405,8 @@ def train():
                         if training_args.save_total_limit > 0:
                             ckpts = sorted(
                                 [d for d in os.listdir(training_args.output_dir)
-                                 if d.startswith("step_") and os.path.isdir(
+                                 if d.startswith("step_") and d[5:].isdigit()
+                                 and os.path.isdir(
                                      os.path.join(training_args.output_dir, d))],
                                 key=lambda x: int(x[5:]),
                             )
