@@ -43,11 +43,13 @@ max_new_tokens=512
 block_size=32
 threshold=0.5
 editing_threshold=0.0
-max_post_steps=4
+max_post_steps=16
 num_to_transfer=1
 temperature=0.0
+batch_size=1
 limit="16"
-offset="65"  # last 16
+offset="148"  # last 16
+num_workers=4
 output_dir=""  # set after arg parsing
 
 while [[ $# -gt 0 ]]; do
@@ -59,6 +61,8 @@ while [[ $# -gt 0 ]]; do
     --max_post_steps)     max_post_steps="$2";      shift 2 ;;
     --num_to_transfer)    num_to_transfer="$2";     shift 2 ;;
     --temperature)        temperature="$2";         shift 2 ;;
+    --batch_size)         batch_size="$2";          shift 2 ;;
+    --num_workers)        num_workers="$2";         shift 2 ;;
     --output_dir)         output_dir="$2";          shift 2 ;;
     --limit)              limit="$2";               shift 2 ;;
     --offset)             offset="$2";              shift 2 ;;
@@ -68,7 +72,7 @@ done
 
 # Build output_dir from max_new_tokens and limit
 if [[ -z "${output_dir}" ]]; then
-  output_dir="results/llada21_humaneval_len${max_new_tokens}_middle_limit${limit}/default_max_post_steps${max_post_steps}"
+  output_dir="results/llada21_humaneval_len${max_new_tokens}_last_limit${limit}/default_max_post_steps${max_post_steps}"
 fi
 
 echo "===== Eval settings ====="
@@ -77,6 +81,7 @@ echo "max_new_tokens=${max_new_tokens}  block_size=${block_size}"
 echo "threshold=${threshold}  editing_threshold=${editing_threshold}"
 echo "max_post_steps=${max_post_steps}  num_to_transfer=${num_to_transfer}"
 echo "temperature=${temperature}"
+echo "batch_size=${batch_size}  num_workers=${num_workers}"
 echo "output_dir=${output_dir}"
 [[ -n "${limit}" ]] && echo "limit=${limit}"
 [[ -n "${offset}" ]] && echo "offset=${offset}"
@@ -118,7 +123,7 @@ fi
 python dllm/pipelines/llada21/eval.py \
     --tasks humaneval_instruct_llada --num_fewshot 0 \
     --model llada21 --apply_chat_template \
-    --batch_size 1 \
-    --model_args "pretrained=${model_name_or_path},max_new_tokens=${max_new_tokens},block_size=${block_size},threshold=${threshold},editing_threshold=${editing_threshold},max_post_steps=${max_post_steps},num_to_transfer=${num_to_transfer},temperature=${temperature},eos_early_stop=True" \
+    --batch_size "${batch_size}" \
+    --model_args "pretrained=${model_name_or_path},max_new_tokens=${max_new_tokens},block_size=${block_size},threshold=${threshold},editing_threshold=${editing_threshold},max_post_steps=${max_post_steps},num_to_transfer=${num_to_transfer},temperature=${temperature},eos_early_stop=True,num_workers=${num_workers},output_dir=${output_dir}" \
     --confirm_run_unsafe_code \
     "${extra_args[@]}"

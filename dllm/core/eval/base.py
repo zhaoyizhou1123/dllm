@@ -7,6 +7,8 @@ Run: Not runnable directly; use pipeline eval entrypoints (e.g. dllm.pipelines.l
 """
 
 import dataclasses
+import json
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -108,6 +110,7 @@ class BaseEvalHarness(LM):
 
         self.batch_size = int(kwargs.get("batch_size", eval_config.batch_size))
         self.num_workers = int(kwargs.get("num_workers", 1))
+        self.output_dir = kwargs.get("output_dir", None)
 
     @property
     def rank(self) -> int:
@@ -135,6 +138,23 @@ class BaseEvalHarness(LM):
         )
 
     # ── Unified generate_until scaffolding ────────────────────────────
+
+    def _save_generation(self, request: Instance, answer: str) -> None:
+        """Append a completed generation to the incremental JSONL log."""
+        if self.output_dir is None:
+            return
+        path = os.path.join(self.output_dir, "generations.jsonl")
+        line = json.dumps(
+            {
+                "doc_id": request.doc_id,
+                "task_name": request.task_name,
+                "context": request.args[0],
+                "generated": answer,
+            },
+            ensure_ascii=False,
+        )
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
     def _process_request(self, request: Instance, stream) -> str:
         """Process a single generation request, optionally on a dedicated CUDA stream."""
@@ -194,10 +214,11 @@ class BaseEvalHarness(LM):
                 [p.tolist() for p in prompts],
             )
 
-            for answer, gen_kwargs in zip(generated_answers, gen_kwargs_list):
+            for inst, answer, gen_kwargs in zip(batch, generated_answers, gen_kwargs_list):
                 for stop_seq in gen_kwargs["until"]:
                     if stop_seq in answer:
                         answer = answer.split(stop_seq)[0]
+                self._save_generation(inst, answer)
                 out.append(answer)
 
             if self.accelerator is not None:
@@ -223,7 +244,9 @@ class BaseEvalHarness(LM):
 
             for future in tqdm(as_completed(futures), total=len(requests), desc="Generating..."):
                 idx = futures[future]
-                results[idx] = future.result()
+                answer = future.result()
+                self._save_generation(requests[idx], answer)
+                results[idx] = answer
 
         return results
 

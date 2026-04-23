@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=eval_llada21_confidence_gibbs_edit_humaneval
 #SBATCH --output=slurm/%x/job_%A_%a.out
-#SBATCH --array=1
+#SBATCH --array=0-2
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=1
@@ -22,15 +22,15 @@ min_transfer=1
 temperature=0.0
 batch_size=1
 limit="16"
-offset="65" # middle 16
+offset="148" # last 16
 edit_freq=1
-edit_step_sweep=(10 20)
+edit_step_sweep=(10 20 50)
 edit_step="${edit_step_sweep[${SLURM_ARRAY_TASK_ID:-0}]}"
 edit_strategy="gibbs_edit"
 remasking_strategy="random"
 early_exit_number=2
 num_workers=4
-output_dir="results/llada21_humaneval_len${max_new_tokens}_middle_limit${limit}/confidence${threshold}_block_${edit_strategy}_step${edit_step}_early_exit${early_exit_number}_postedit"
+output_dir="results/llada21_humaneval_len${max_new_tokens}_last_limit${limit}/confidence${threshold}_block_${edit_strategy}_step${edit_step}_early_exit${early_exit_number}_postedit"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -105,6 +105,6 @@ python dllm/pipelines/llada21/eval.py \
     --tasks humaneval_instruct_llada --num_fewshot 0 \
     --model llada21_confidence_block --apply_chat_template \
     --batch_size "${batch_size}" \
-    --model_args "pretrained=${model_name_or_path},max_new_tokens=${max_new_tokens},block_size=${block_size},threshold=${threshold},min_transfer=${min_transfer},temperature=${temperature},eos_early_stop=True,edit_freq=${edit_freq},edit_step=${edit_step},edit_strategy=${edit_strategy},remasking_strategy=${remasking_strategy},early_exit_number=${early_exit_number},num_workers=${num_workers}" \
+    --model_args "pretrained=${model_name_or_path},max_new_tokens=${max_new_tokens},block_size=${block_size},threshold=${threshold},min_transfer=${min_transfer},temperature=${temperature},eos_early_stop=True,edit_freq=${edit_freq},edit_step=${edit_step},edit_strategy=${edit_strategy},remasking_strategy=${remasking_strategy},early_exit_number=${early_exit_number},num_workers=${num_workers},output_dir=${output_dir}" \
     --confirm_run_unsafe_code \
     "${extra_args[@]}"
