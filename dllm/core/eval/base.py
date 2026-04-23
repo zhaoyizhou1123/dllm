@@ -7,6 +7,8 @@ Run: Not runnable directly; use pipeline eval entrypoints (e.g. dllm.pipelines.l
 """
 
 import dataclasses
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
 
 import accelerate
@@ -105,6 +107,7 @@ class BaseEvalHarness(LM):
             self.accelerator = None
 
         self.batch_size = int(kwargs.get("batch_size", eval_config.batch_size))
+        self.num_workers = int(kwargs.get("num_workers", 1))
 
     @property
     def rank(self) -> int:
@@ -133,8 +136,36 @@ class BaseEvalHarness(LM):
 
     # ── Unified generate_until scaffolding ────────────────────────────
 
+    def _process_request(self, request: Instance, stream) -> str:
+        """Process a single generation request, optionally on a dedicated CUDA stream."""
+        ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
+        with torch.no_grad(), ctx:
+            context, gen_kwargs = request.args
+            prompt = torch.tensor(
+                self.tokenizer(context)["input_ids"],
+                device=self.device,
+                dtype=torch.long,
+            )
+            generated_ids = self.sampler.sample(
+                inputs=[prompt],
+                config=self.sampler_config,
+                return_dict=False,
+            )
+            answer = dllm.utils.sample_trim(
+                self.tokenizer,
+                generated_ids.tolist(),
+                [prompt.tolist()],
+            )[0]
+            for stop_seq in gen_kwargs["until"]:
+                if stop_seq in answer:
+                    answer = answer.split(stop_seq)[0]
+            return answer
+
     @torch.no_grad()
     def generate_until(self, requests: list[Instance]) -> list[str]:
+        if self.num_workers > 1:
+            return self._generate_until_parallel(requests)
+
         out: list[str] = []
 
         for batch_start in tqdm(
@@ -173,6 +204,28 @@ class BaseEvalHarness(LM):
                 self.accelerator.wait_for_everyone()
 
         return out
+
+    def _generate_until_parallel(self, requests: list[Instance]) -> list[str]:
+        """Process requests concurrently with a thread pool and per-thread CUDA streams."""
+        if self.device.type == "cuda":
+            streams = [torch.cuda.Stream(device=self.device) for _ in range(self.num_workers)]
+        else:
+            streams = [None] * self.num_workers
+
+        results: list[str | None] = [None] * len(requests)
+
+        with ThreadPoolExecutor(max_workers=self.num_workers) as pool:
+            futures = {}
+            for i, req in enumerate(requests):
+                stream = streams[i % self.num_workers]
+                future = pool.submit(self._process_request, req, stream)
+                futures[future] = i
+
+            for future in tqdm(as_completed(futures), total=len(requests), desc="Generating..."):
+                idx = futures[future]
+                results[idx] = future.result()
+
+        return results
 
     def loglikelihood(self, requests):
         raise NotImplementedError
