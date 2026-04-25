@@ -298,6 +298,7 @@ class LLaDA21GibbsBlockSamplerConfig(BaseSamplerConfig):
     remasking_strategy: str = "random"
     keep_original_mask: bool = True
     early_exit_number: int = 5
+    skip_blocks: int = 0
 
 
 @dataclass
@@ -331,6 +332,7 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
         remasking_strategy = kwargs.get("remasking_strategy", config.remasking_strategy)
         keep_original_mask = bool(kwargs.get("keep_original_mask", config.keep_original_mask))
         early_exit_number = int(kwargs.get("early_exit_number", config.early_exit_number))
+        skip_blocks = int(kwargs.get("skip_blocks", config.skip_blocks))
 
         mask_id = self.tokenizer.mask_token_id
         eos_id = self.tokenizer.eos_token_id
@@ -426,6 +428,7 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
                     and (global_step + 1) % edit_freq == 0
                     and gen_step >= edit_start
                     and edit_step > 0
+                    and blk - prompt_blocks >= skip_blocks
                 ):
                     logits_block = gibbs_correct(
                         x, blk_start, window_end, logits_block,
