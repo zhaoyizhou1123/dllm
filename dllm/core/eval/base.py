@@ -111,6 +111,7 @@ class BaseEvalHarness(LM):
         self.batch_size = int(kwargs.get("batch_size", eval_config.batch_size))
         self.num_workers = int(kwargs.get("num_workers", 1))
         self.output_dir = kwargs.get("output_dir", None)
+        self.reuse = kwargs.get("reuse", False)
 
     @property
     def rank(self) -> int:
@@ -156,6 +157,23 @@ class BaseEvalHarness(LM):
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
+    def _load_cached_generations(self) -> dict[int, str]:
+        """Load previously completed generations from generations.jsonl."""
+        cache: dict[int, str] = {}
+        if self.output_dir is None:
+            return cache
+        path = os.path.join(self.output_dir, "generations.jsonl")
+        if not os.path.exists(path):
+            return cache
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                cache[entry["doc_id"]] = entry["generated"]
+        return cache
+
     def _process_request(self, request: Instance, stream) -> str:
         """Process a single generation request, optionally on a dedicated CUDA stream."""
         ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
@@ -183,9 +201,30 @@ class BaseEvalHarness(LM):
 
     @torch.no_grad()
     def generate_until(self, requests: list[Instance]) -> list[str]:
-        if self.num_workers > 1:
-            return self._generate_until_parallel(requests)
+        cache = self._load_cached_generations() if self.reuse else {}
 
+        if cache:
+            uncached = [r for r in requests if r.doc_id not in cache]
+            n_cached = len(requests) - len(uncached)
+            tqdm.write(
+                f"Reusing {n_cached}/{len(requests)} cached generations, "
+                f"generating {len(uncached)} remaining"
+            )
+        else:
+            uncached = requests
+
+        if uncached:
+            if self.num_workers > 1:
+                uncached_results = self._generate_until_parallel(uncached)
+            else:
+                uncached_results = self._generate_until_sequential(uncached)
+            gen_map = {r.doc_id: a for r, a in zip(uncached, uncached_results)}
+        else:
+            gen_map = {}
+
+        return [cache.get(r.doc_id) or gen_map.get(r.doc_id) for r in requests]
+
+    def _generate_until_sequential(self, requests: list[Instance]) -> list[str]:
         out: list[str] = []
 
         for batch_start in tqdm(

@@ -21,8 +21,8 @@ threshold=0.5
 min_transfer=1
 temperature=0.0
 batch_size=1
-limit="16"
-offset="148" # last 16
+limit=""
+offset=""
 edit_freq=1
 edit_step_sweep=(10 20 50)
 edit_step="${edit_step_sweep[${SLURM_ARRAY_TASK_ID:-0}]}"
@@ -30,7 +30,7 @@ edit_strategy="gibbs_edit"
 remasking_strategy="random"
 early_exit_number=2
 num_workers=4
-output_dir="results/llada21_humaneval_len${max_new_tokens}_last_limit${limit}/confidence${threshold}_block_${edit_strategy}_step${edit_step}_early_exit${early_exit_number}_postedit"
+output_dir="results/llada21_humaneval_len${max_new_tokens}/confidence${threshold}_block_${edit_strategy}_step${edit_step}_early_exit${early_exit_number}_postedit"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
