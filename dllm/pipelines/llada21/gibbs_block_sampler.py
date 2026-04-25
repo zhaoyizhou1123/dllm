@@ -424,7 +424,7 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
                 if (
                     edit_freq > 0
                     and (global_step + 1) % edit_freq == 0
-                    and global_step >= edit_start
+                    and gen_step >= edit_start
                     and edit_step > 0
                 ):
                     logits_block = gibbs_correct(
