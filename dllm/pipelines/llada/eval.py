@@ -16,6 +16,8 @@ from lm_eval.api.registry import register_model
 
 from dllm.core.eval import MDLMEvalConfig, MDLMEvalHarness
 from dllm.core.samplers import (
+    GibbsBlockSampler,
+    GibbsBlockSamplerConfig,
     GibbsSampler,
     GibbsSamplerConfig,
     MDLMSampler,
@@ -88,6 +90,51 @@ class LLaDAGibbsEvalHarness(MDLMEvalHarness):
     ):
         eval_config = eval_config or LLaDAEvalConfig()
         sampler_config = sampler_config or LLaDAGibbsEvalSamplerConfig()
+
+        super().__init__(
+            eval_config=eval_config,
+            sampler_config=sampler_config,
+            sampler_cls=sampler_cls,
+            **kwargs,
+        )
+
+
+@dataclass
+class LLaDAGibbsBlockEvalSamplerConfig(GibbsBlockSamplerConfig):
+    """Default sampler config for LLaDA eval with fixed-schedule Gibbs block sampling."""
+
+    max_new_tokens: int = 256
+    block_size: int = 32
+    unmasking_num: int = 1
+    temperature: float = 0.0
+    eos_early_stop: bool = True
+
+
+@dataclass
+class LLaDAGibbsBlockEvalConfig(LLaDAEvalConfig):
+    """LLaDA Gibbs block eval config."""
+
+    batch_size: int = 1
+
+
+@register_model("llada_gibbs_block")
+class LLaDAGibbsBlockEvalHarness(MDLMEvalHarness):
+    """LLaDA eval harness wired to GibbsBlockSampler (fixed-schedule + Gibbs).
+
+    Select one of the three Gibbs variants via ``--model_args edit_strategy=...``:
+    ``gibbs_standard`` | ``gibbs_edit`` | ``gibbs_edit_v2``. Set ``edit_freq=-1``
+    to disable correction (reduces to fixed-schedule block sampling).
+    """
+
+    def __init__(
+        self,
+        eval_config: LLaDAGibbsBlockEvalConfig | None = None,
+        sampler_config: GibbsBlockSamplerConfig | None = None,
+        sampler_cls: type[GibbsBlockSampler] = GibbsBlockSampler,
+        **kwargs,
+    ):
+        eval_config = eval_config or LLaDAGibbsBlockEvalConfig()
+        sampler_config = sampler_config or LLaDAGibbsBlockEvalSamplerConfig()
 
         super().__init__(
             eval_config=eval_config,

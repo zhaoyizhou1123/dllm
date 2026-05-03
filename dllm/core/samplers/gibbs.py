@@ -48,6 +48,8 @@ class GibbsSamplerConfig(MDLMSamplerConfig):
     remasking_strategy: str = "random"  # "random" | "low_confidence"
     threshold: float | None = None  # skip Gibbs if avg response confidence exceeds this
     keep_original_mask: bool = True  # final remask of gibbs_standard/gibbs_edit uses input-x mask pattern; False → remasking_strategy
+    early_exit_number: int = 0  # exit Gibbs loop after this many consecutive unchanged iterations; 0 disables
+    early_commit: bool = False  # if True, on early exit commit the fully revealed sequence and skip remaining decoding
 
 
 @dataclass
@@ -92,10 +94,19 @@ class GibbsSampler(MDLMSampler):
         keep_original_mask = bool(
             kwargs.get("keep_original_mask", config.keep_original_mask)
         )
+        eos_early_stop = kwargs.get(
+            "eos_early_stop", getattr(config, "eos_early_stop", False)
+        )
+        early_exit_number = int(
+            kwargs.get("early_exit_number", config.early_exit_number)
+        )
+        early_commit = bool(
+            kwargs.get("early_commit", config.early_commit)
+        )
 
         assert 1 <= block_size
         assert 1 <= steps
-        assert edit_strategy in ("gibbs_standard", "gibbs_edit", "gibbs_edit_v2")
+        assert edit_strategy in ("gibbs_standard", "gibbs_edit", "gibbs_edit_v2", "proseco_eval")
         assert remasking_strategy in ("random", "low_confidence")
 
         mask_id = self.tokenizer.mask_token_id
@@ -152,6 +163,8 @@ class GibbsSampler(MDLMSampler):
         histories = [x.clone()] if return_dict else None
 
         global_step = 0  # counter across all blocks (drives edit_freq)
+        gen_start = min(prompt_lens)  # start of the generated region
+        should_stop = False
 
         for b in range(num_blocks):
             block_mask_index = torch.zeros(
@@ -201,7 +214,17 @@ class GibbsSampler(MDLMSampler):
                     and global_step >= edit_start
                     and edit_step > 0
                 ):
-                    x, logits = self._gibbs_correct(
+                    # Build correction scope: True for [prompt_len_j : block_end_j]
+                    correction_scope = torch.zeros(
+                        (B, T), dtype=torch.bool, device=x.device
+                    )
+                    for j in range(B):
+                        be = min(
+                            prompt_lens[j] + (b + 1) * block_size, T
+                        )
+                        correction_scope[j, prompt_lens[j]:be] = True
+
+                    x, logits, early_exited = self._gibbs_correct(
                         x=x,
                         logits=logits,
                         prompt_mask=prompt_mask,
@@ -215,7 +238,18 @@ class GibbsSampler(MDLMSampler):
                         begin_suppress_tokens=begin_suppress_tokens,
                         right_shift_logits=right_shift_logits,
                         keep_original_mask=keep_original_mask,
+                        correction_scope=correction_scope,
+                        early_exit_number=early_exit_number,
                     )
+                    if early_commit and early_exited:
+                        logits = self._gibbs_forward(
+                            x, attention_mask, suppress_tokens, right_shift_logits
+                        )
+                        preds = torch.argmax(logits, dim=-1)
+                        mask_pos = x == mask_id
+                        x[mask_pos] = preds[mask_pos]
+                        should_stop = True
+                        break
                     mask_index = x == mask_id  # Gibbs may have remasked new positions
 
                 # ----- Argmax + confidence + topk commit -----
@@ -227,7 +261,7 @@ class GibbsSampler(MDLMSampler):
                         logits[:, :, token_id] = -torch.inf
 
                 if remasking == "low_confidence":
-                    p = F.softmax(logits, dim=-1)
+                    p = F.softmax(logits.to(torch.float64), dim=-1)
                     x0_p = torch.squeeze(
                         torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
                     )
@@ -258,6 +292,73 @@ class GibbsSampler(MDLMSampler):
                     histories.append(x.clone())
 
                 global_step += 1
+
+            if should_stop:
+                break
+
+            # -- Post-editing: refine current block without remasking --
+            if edit_step > 0:
+                blk_start = min(prompt_lens[0] + b * block_size, T)
+                blk_end = min(prompt_lens[0] + (b + 1) * block_size, T)
+                block_len = blk_end - blk_start
+                non_prompt_block = torch.ones(
+                    (B, block_len), dtype=torch.bool, device=x.device
+                )
+                for j in range(B):
+                    if prompt_lens[j] > blk_start:
+                        end = min(prompt_lens[j] - blk_start, block_len)
+                        non_prompt_block[j, :end] = False
+
+                prev_region = None
+                consecutive_unchanged = 0
+
+                for _edit_iter in range(edit_step):
+                    logits = self._gibbs_forward(
+                        x, attention_mask, suppress_tokens, right_shift_logits
+                    )
+                    logits_block = logits[:, blk_start:blk_end, :]
+                    new_pred = torch.argmax(logits_block, dim=-1)
+
+                    block_slice = x[:, blk_start:blk_end]
+                    new_block = torch.where(non_prompt_block, new_pred, block_slice)
+                    x[:, blk_start:blk_end] = new_block
+
+                    if histories is not None:
+                        histories.append(x.clone())
+
+                    if early_exit_number > 0:
+                        cur_region = x[:, gen_start:blk_end].clone()
+                        if prev_region is not None and torch.equal(cur_region, prev_region):
+                            consecutive_unchanged += 1
+                            if consecutive_unchanged >= early_exit_number:
+                                if early_commit:
+                                    logits = self._gibbs_forward(
+                                        x, attention_mask, suppress_tokens,
+                                        right_shift_logits,
+                                    )
+                                    preds = torch.argmax(logits, dim=-1)
+                                    mask_pos = x == mask_id
+                                    x[mask_pos] = preds[mask_pos]
+                                    should_stop = True
+                                break
+                        else:
+                            consecutive_unchanged = 0
+                        prev_region = cur_region
+
+            if should_stop:
+                break
+
+            # ----- EOS early stop (per proseco: stop when block ends with EOS) -----
+            if eos_early_stop and eos_id is not None:
+                all_eos = True
+                for j in range(B):
+                    be = min(prompt_lens[j] + (b + 1) * block_size, T)
+                    if x[j, be - 1] != eos_id:
+                        all_eos = False
+                        break
+                if all_eos:
+                    x[x == mask_id] = eos_id
+                    break
 
         if not return_dict:
             return x
@@ -340,8 +441,11 @@ class GibbsSampler(MDLMSampler):
         begin_suppress_tokens,
         right_shift_logits: bool,
         keep_original_mask: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Dispatch to the correct Gibbs variant and return (x_new, logits_new)."""
+        correction_scope: torch.Tensor | None = None,
+        remask_scope: torch.Tensor | None = None,
+        early_exit_number: int = 0,
+    ) -> tuple[torch.Tensor, torch.Tensor, bool]:
+        """Dispatch to the correct Gibbs variant and return (x_new, logits_new, early_exited)."""
         # Optional threshold early-exit: if the response region is already
         # confident, shrink edit_step to 1 (cheap one-shot correction).
         if threshold is not None:
@@ -358,42 +462,55 @@ class GibbsSampler(MDLMSampler):
 
         if edit_strategy == "gibbs_standard":
             return self._gibbs_standard(
-                x, logits, prompt_mask, attention_mask, mask_id,
+                x, logits, correction_scope, attention_mask, mask_id,
                 edit_step, remasking_strategy,
                 suppress_tokens, begin_suppress_tokens, right_shift_logits,
-                keep_original_mask,
+                keep_original_mask, early_exit_number,
             )
         if edit_strategy == "gibbs_edit":
             return self._gibbs_edit_v1(
-                x, logits, prompt_mask, attention_mask, mask_id,
+                x, logits, correction_scope, attention_mask, mask_id,
                 edit_step, remasking_strategy,
                 suppress_tokens, begin_suppress_tokens, right_shift_logits,
-                keep_original_mask,
+                keep_original_mask, early_exit_number,
+                remask_scope=remask_scope,
             )
         if edit_strategy == "gibbs_edit_v2":
             return self._gibbs_edit_v2(
-                x, logits, prompt_mask, attention_mask, mask_id,
+                x, logits, correction_scope, attention_mask, mask_id,
                 edit_step, remasking_strategy,
                 suppress_tokens, begin_suppress_tokens, right_shift_logits,
+                early_exit_number,
             )
+        if edit_strategy == "proseco_eval":
+            x, logits = self._proseco_correct(
+                x, logits, prompt_mask, attention_mask, mask_id,
+                edit_step, suppress_tokens, right_shift_logits,
+                correction_scope,
+            )
+            return x, logits, False
         raise ValueError(f"Unknown edit_strategy: {edit_strategy}")
 
     @torch.no_grad()
     def _gibbs_standard(
         self,
-        x, logits, prompt_mask, attention_mask, mask_id,
+        x, logits, correction_scope, attention_mask, mask_id,
         edit_step, remasking_strategy,
         suppress_tokens, begin_suppress_tokens, right_shift_logits,
-        keep_original_mask,
+        keep_original_mask, early_exit_number,
     ):
         """Ported from mdm_gibbs_standard_sampling. Inner reveal touches only masked positions."""
         B, L = x.shape
         device = x.device
-        original_mask = x == mask_id
+        scope_prompt_mask = ~correction_scope  # for _compute_remask compatibility
+        original_mask = (x == mask_id) & correction_scope
         num_masks = original_mask.sum(dim=-1)
 
         new_pred = torch.argmax(logits, dim=-1)
         yt = torch.where(original_mask, new_pred, x)
+        prev_yt = None
+        consecutive_count = 0
+        early_exited = False
 
         for _ in range(edit_step):
             k_max = int(num_masks.max().item())
@@ -406,7 +523,7 @@ class GibbsSampler(MDLMSampler):
                     new_pred = torch.argmax(logits, dim=-1)
                     yt = torch.where(yt == mask_id, new_pred, yt)
                 remask = self._compute_remask(
-                    B, L, num_masks, k_max, prompt_mask,
+                    B, L, num_masks, k_max, scope_prompt_mask,
                     logits, remasking_strategy, begin_suppress_tokens, device,
                 )
                 yt = yt.clone()
@@ -417,6 +534,16 @@ class GibbsSampler(MDLMSampler):
             )
             new_pred = torch.argmax(logits, dim=-1)
             yt = torch.where(yt == mask_id, new_pred, yt)
+
+            if early_exit_number > 0:
+                if prev_yt is not None and torch.equal(yt, prev_yt):
+                    consecutive_count += 1
+                    if consecutive_count >= early_exit_number:
+                        early_exited = True
+                        break
+                else:
+                    consecutive_count = 0
+                prev_yt = yt.clone()
 
         # Final: fresh forward, full reveal, then remask.
         logits = self._gibbs_forward(
@@ -432,35 +559,48 @@ class GibbsSampler(MDLMSampler):
             k_max = int(num_masks.max().item())
             if k_max > 0:
                 remask = self._compute_remask(
-                    B, L, num_masks, k_max, prompt_mask,
+                    B, L, num_masks, k_max, scope_prompt_mask,
                     logits, remasking_strategy, begin_suppress_tokens, device,
                 )
                 yt = yt.clone()
                 yt[remask] = mask_id
-        return yt, logits
+        logits = self._gibbs_forward(yt, attention_mask, suppress_tokens, right_shift_logits)
+        return yt, logits, early_exited
 
     @torch.no_grad()
     def _gibbs_edit_v1(
         self,
-        x, logits, prompt_mask, attention_mask, mask_id,
+        x, logits, correction_scope, attention_mask, mask_id,
         edit_step, remasking_strategy,
         suppress_tokens, begin_suppress_tokens, right_shift_logits,
-        keep_original_mask,
+        keep_original_mask, early_exit_number,
+        remask_scope: torch.Tensor | None = None,
     ):
         """Ported from mdm_gibbs_edit_sampling. Final step restores the original mask pattern."""
         B, L = x.shape
         device = x.device
-        unmask_indices = x != mask_id  # frozen snapshot of originally-unmasked positions
-        num_masks = (x == mask_id).sum(dim=-1)
+        # Remasking is constrained to remask_scope (current block) when provided;
+        # correction (predict/fill) still uses the full correction_scope.
+        if remask_scope is None:
+            remask_scope = correction_scope
+        remask_prompt_mask = ~remask_scope  # for _compute_remask compatibility
+        unmask_indices = (x != mask_id) | ~correction_scope  # originally-unmasked OR out-of-scope
+        num_masks = ((x == mask_id) & remask_scope).sum(dim=-1)
+        # Future masked positions: fill with predictions for forward context
+        future_fill = (x == mask_id) & ~correction_scope & attention_mask.bool()
 
         new_pred = torch.argmax(logits, dim=-1)
-        yt = torch.where(~prompt_mask, new_pred, x)
+        yt = torch.where(correction_scope, new_pred, x)
+        yt[future_fill] = new_pred[future_fill]
+        prev_yt = None
+        consecutive_count = 0
+        early_exited = False
 
         for _ in range(edit_step):
             k_max = int(num_masks.max().item())
             if k_max > 0:
                 remask = self._compute_remask(
-                    B, L, num_masks, k_max, prompt_mask,
+                    B, L, num_masks, k_max, remask_prompt_mask,
                     logits, remasking_strategy, begin_suppress_tokens, device,
                 )
                 yt = yt.clone()
@@ -470,46 +610,66 @@ class GibbsSampler(MDLMSampler):
                 yt, attention_mask, suppress_tokens, right_shift_logits
             )
             new_pred = torch.argmax(logits, dim=-1)
-            yt = torch.where(~prompt_mask, new_pred, x)
+            yt = torch.where(correction_scope, new_pred, x)
+            yt[future_fill] = new_pred[future_fill]
+
+            if early_exit_number > 0:
+                if prev_yt is not None and torch.equal(yt, prev_yt):
+                    consecutive_count += 1
+                    if consecutive_count >= early_exit_number:
+                        early_exited = True
+                        break
+                else:
+                    consecutive_count = 0
+                prev_yt = yt.clone()
+
+        # Clear future fills before constructing output
+        yt[future_fill] = x[future_fill]
 
         if keep_original_mask:
             # Restore original mask pattern: originally unmasked positions take yt's
             # latest prediction; originally masked positions stay as mask_id.
             xt_out = torch.where(unmask_indices, yt, x)
         else:
-            # yt already holds predictions for all non-prompt positions; pick
+            # yt already holds predictions for all in-scope positions; pick
             # num_masks remask positions via remasking_strategy.
             k_max = int(num_masks.max().item())
             if k_max > 0:
                 remask = self._compute_remask(
-                    B, L, num_masks, k_max, prompt_mask,
+                    B, L, num_masks, k_max, remask_prompt_mask,
                     logits, remasking_strategy, begin_suppress_tokens, device,
                 )
                 yt = yt.clone()
                 yt[remask] = mask_id
             xt_out = yt
-        return xt_out, logits
+        logits = self._gibbs_forward(xt_out, attention_mask, suppress_tokens, right_shift_logits)
+        return xt_out, logits, early_exited
 
     @torch.no_grad()
     def _gibbs_edit_v2(
         self,
-        x, logits, prompt_mask, attention_mask, mask_id,
+        x, logits, correction_scope, attention_mask, mask_id,
         edit_step, remasking_strategy,
         suppress_tokens, begin_suppress_tokens, right_shift_logits,
+        early_exit_number,
     ):
         """Ported from mdm_gibbs_edit_sampling_v2. Final step remasks num_masks positions on yt."""
         B, L = x.shape
         device = x.device
-        num_masks = (x == mask_id).sum(dim=-1)
+        scope_prompt_mask = ~correction_scope
+        num_masks = ((x == mask_id) & correction_scope).sum(dim=-1)
 
         new_pred = torch.argmax(logits, dim=-1)
-        yt = torch.where(~prompt_mask, new_pred, x)
+        yt = torch.where(correction_scope, new_pred, x)
+        prev_yt = None
+        consecutive_count = 0
+        early_exited = False
 
         for _ in range(edit_step):
             k_max = int(num_masks.max().item())
             if k_max > 0:
                 remask = self._compute_remask(
-                    B, L, num_masks, k_max, prompt_mask,
+                    B, L, num_masks, k_max, scope_prompt_mask,
                     logits, remasking_strategy, begin_suppress_tokens, device,
                 )
                 yt = yt.clone()
@@ -519,17 +679,88 @@ class GibbsSampler(MDLMSampler):
                 yt, attention_mask, suppress_tokens, right_shift_logits
             )
             new_pred = torch.argmax(logits, dim=-1)
-            yt = torch.where(~prompt_mask, new_pred, x)
+            yt = torch.where(correction_scope, new_pred, x)
 
-        # Final: reveal all non-prompt, then remask num_masks positions.
+            if early_exit_number > 0:
+                if prev_yt is not None and torch.equal(yt, prev_yt):
+                    consecutive_count += 1
+                    if consecutive_count >= early_exit_number:
+                        early_exited = True
+                        break
+                else:
+                    consecutive_count = 0
+                prev_yt = yt.clone()
+
+        # Final: reveal all in-scope, then remask num_masks positions.
         new_pred = torch.argmax(logits, dim=-1)
-        yt = torch.where(~prompt_mask, new_pred, x)
+        yt = torch.where(correction_scope, new_pred, x)
         k_max = int(num_masks.max().item())
         if k_max > 0:
             remask = self._compute_remask(
-                B, L, num_masks, k_max, prompt_mask,
+                B, L, num_masks, k_max, scope_prompt_mask,
                 logits, remasking_strategy, begin_suppress_tokens, device,
             )
             yt = yt.clone()
             yt[remask] = mask_id
-        return yt, logits
+        logits = self._gibbs_forward(yt, attention_mask, suppress_tokens, right_shift_logits)
+        return yt, logits, early_exited
+
+    @torch.no_grad()
+    def _proseco_correct(
+        self,
+        x, logits, prompt_mask, attention_mask, mask_id,
+        edit_step, suppress_tokens, right_shift_logits,
+        correction_scope,
+    ):
+        """Proseco-style mask-free fixed-point correction (full sequence).
+
+        Matches the proseco reference implementation:
+        1. Clone x, fill ALL non-prompt positions with argmax (no masks visible
+           to the corrector), then restore committed (non-masked) positions
+           within correction_scope.
+        2. Iterate: full forward → argmax → replace only within
+           correction_scope (prompt_len:block_end). Stop early on convergence.
+        3. Merge back: update logits within scope and only write non-masked
+           (committed) positions back into x.
+
+        Args:
+            correction_scope: (B, L) bool mask, True for positions in
+                [prompt_len:block_end] per sample (the active correction region).
+        """
+        non_prompt = ~prompt_mask
+        # active_mask: masked positions within correction scope
+        active_mask = (x == mask_id) & correction_scope
+        # committed: non-masked positions within correction scope
+        committed = correction_scope & ~active_mask
+
+        # --- Initial fill: all non-prompt → argmax, then restore committed ---
+        new_pred = torch.argmax(logits, dim=-1)
+        corrector_x = x.clone()
+        # Fill ALL non-prompt positions (including beyond block_end) with argmax
+        corrector_x[non_prompt] = new_pred[non_prompt]
+        # Restore committed (originally non-masked) positions within scope
+        corrector_x[committed] = x[committed]
+
+        # --- Fixed-point iteration (only update within scope) ---
+        corrector_logits = None
+        for _ in range(edit_step):
+            corrector_logits = self._gibbs_forward(
+                corrector_x, attention_mask, suppress_tokens, right_shift_logits,
+            )
+            corrected = torch.argmax(corrector_logits, dim=-1)
+            # Convergence check: only within correction scope
+            if torch.equal(
+                corrector_x[correction_scope], corrected[correction_scope]
+            ):
+                break
+            # Only update within scope (not future blocks)
+            new_cx = corrector_x.clone()
+            new_cx[correction_scope] = corrected[correction_scope]
+            corrector_x = new_cx
+
+        # --- Merge back into x and logits (within scope only) ---
+        if corrector_logits is not None:
+            logits[correction_scope] = corrector_logits[correction_scope]
+            # Only update non-masked (committed) positions in x
+            x[committed] = corrector_x[committed]
+        return x, logits

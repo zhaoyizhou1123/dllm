@@ -1,12 +1,22 @@
 """
-Fixed-schedule block diffusion sampler for LLaDA2.1 with Gibbs correction.
+Fixed-schedule block diffusion sampler with Gibbs correction for LLaDA 1.x.
 
-Run:
-    python dllm/pipelines/llada21/eval.py \
-        --tasks humaneval_instruct_llada --num_fewshot 0 \
-        --model llada21_gibbs_block --apply_chat_template \
-        --batch_size 1 \
-        --model_args "pretrained=inclusionAI/LLaDA2.1-mini,max_new_tokens=256,block_size=32,unmasking_num=1,temperature=0.0,eos_early_stop=True,edit_freq=1,edit_step=10,edit_strategy=gibbs_standard,remasking_strategy=random" \
+Adapted from ``dllm.pipelines.llada21.gibbs_block_sampler`` for models that
+use bidirectional full-sequence attention (no ``position_ids``, 2-D
+``attention_mask``).  The core algorithm is identical: within each block,
+unmask ``unmasking_num`` tokens per step (fixed schedule), and optionally
+apply Gibbs correction every ``edit_freq`` steps.
+
+Run: used via the lm-eval harness, e.g.::
+
+    python dllm/pipelines/llada/eval.py \\
+        --tasks humaneval_instruct_llada --num_fewshot 0 \\
+        --model llada_gibbs_block --apply_chat_template \\
+        --batch_size 1 \\
+        --model_args "pretrained=kuleshov-group/proseco-llada-sft,\\
+max_new_tokens=256,block_size=32,unmasking_num=1,temperature=0.0,\\
+cfg_scale=0.0,suppress_tokens=[126081],begin_suppress_tokens=[],\\
+edit_freq=1,edit_step=10,edit_strategy=gibbs_edit,remasking_strategy=random" \\
         --confirm_run_unsafe_code
 """
 
@@ -20,28 +30,31 @@ from dllm.core.samplers.base import BaseSampler, BaseSamplerConfig, BaseSamplerO
 from dllm.pipelines.llada2.sampler import sample_tokens
 
 
-def block_forward(model, x, window_end, block_size, cur_attn, cur_pos,
+# ────────────────────────── helpers ──────────────────────────
+
+def block_forward(model, x, blk_start, block_size, attention_mask,
                   cfg_scale, unmasked_index, suppress_tokens, mask_id):
+    """Full-sequence forward for LLaDA 1.x, returning logits for the current block."""
     if cfg_scale > 0.0:
-        un_x = x[:, :window_end].clone()
-        un_x[unmasked_index[:, :window_end]] = mask_id
-        x_ = torch.cat([x[:, :window_end], un_x], dim=0)
+        un_x = x.clone()
+        un_x[unmasked_index] = mask_id
+        x_ = torch.cat([x, un_x], dim=0)
         logits = model(
-            x_, attention_mask=cur_attn.expand(2, -1, -1, -1),
-            position_ids=cur_pos.expand(2, -1),
+            x_, attention_mask=attention_mask.repeat(2, 1),
         ).logits
         logits, un_logits = torch.chunk(logits, 2, dim=0)
         logits = un_logits + (cfg_scale + 1) * (logits - un_logits)
     else:
-        logits = model(
-            x[:, :window_end], attention_mask=cur_attn, position_ids=cur_pos,
-        ).logits
-    logits_block = logits[:, -block_size:, :]
+        logits = model(x, attention_mask=attention_mask).logits
+    logits_block = logits[:, blk_start:blk_start + block_size, :]
     if suppress_tokens is not None and len(suppress_tokens) > 0:
         for token_id in suppress_tokens:
             logits_block[:, :, token_id] = -torch.inf
     return logits_block
 
+
+# ── Gibbs correction routines (model-agnostic, operate on block slices) ──
+# These are identical to the ones in llada21/gibbs_block_sampler.py.
 
 def compute_remask(B, block_size, num_masks, k_max, prompt_mask_in_block,
                    logits_block, remasking_strategy, device):
@@ -334,8 +347,10 @@ def gibbs_correct(x, block_start, window_end, logits_block,
     raise ValueError(f"Unknown edit_strategy: {edit_strategy}")
 
 
+# ────────────────────────── config + sampler ──────────────────────────
+
 @dataclass
-class LLaDA21GibbsBlockSamplerConfig(BaseSamplerConfig):
+class GibbsBlockSamplerConfig(BaseSamplerConfig):
     max_new_tokens: int = 128
     max_length: Optional[int] = None
     block_size: int = 32
@@ -347,6 +362,7 @@ class LLaDA21GibbsBlockSamplerConfig(BaseSamplerConfig):
     eos_early_stop: bool = False
     cfg_scale: float = 0.0
     suppress_tokens: Optional[list[int]] = None
+    begin_suppress_tokens: Optional[list[int]] = None
     edit_freq: int = -1
     edit_step: int = 0
     edit_start: int = 0
@@ -358,16 +374,16 @@ class LLaDA21GibbsBlockSamplerConfig(BaseSamplerConfig):
 
 
 @dataclass
-class LLaDA21GibbsBlockSampler(BaseSampler):
+class GibbsBlockSampler(BaseSampler):
     @torch.no_grad()
     def sample(
         self,
         inputs: list[torch.Tensor | list],
-        config: LLaDA21GibbsBlockSamplerConfig | None = None,
+        config: GibbsBlockSamplerConfig | None = None,
         **kwargs,
     ) -> BaseSamplerOutput | torch.Tensor:
         if config is None:
-            config = LLaDA21GibbsBlockSamplerConfig()
+            config = GibbsBlockSamplerConfig()
 
         block_size = kwargs.get("block_size", config.block_size)
         max_new_tokens = kwargs.get("max_new_tokens", config.max_new_tokens)
@@ -380,6 +396,7 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
         eos_early_stop = kwargs.get("eos_early_stop", config.eos_early_stop)
         cfg_scale = kwargs.get("cfg_scale", config.cfg_scale)
         suppress_tokens = kwargs.get("suppress_tokens", config.suppress_tokens)
+        begin_suppress_tokens = kwargs.get("begin_suppress_tokens", config.begin_suppress_tokens)
         return_dict = kwargs.get("return_dict", config.return_dict)
         edit_freq = int(kwargs.get("edit_freq", config.edit_freq))
         edit_step = int(kwargs.get("edit_step", config.edit_step))
@@ -399,79 +416,64 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
                 for p in inputs
             ]
         prompt_lens = [p.shape[0] for p in inputs]
-        if len(set(prompt_lens)) != 1:
-            raise ValueError(
-                "LLaDA21GibbsBlockSampler expects all prompts to have the same length."
-            )
-
-        prompt_len = prompt_lens[0]
-        B = len(inputs)
 
         if max_new_tokens:
-            max_length = max_new_tokens + prompt_len
+            max_length = max_new_tokens + max(prompt_lens)
         else:
-            max_new_tokens = max_length - prompt_len
+            max_new_tokens = max_length - max(prompt_lens)
 
-        num_blocks = (max_length + block_size - 1) // block_size
-        total_len = num_blocks * block_size
-        prompt_blocks = prompt_len // block_size
+        B = len(inputs)
+        T = max_length
 
-        block_mask = torch.tril(
-            torch.ones(num_blocks, num_blocks, device=self.model.device)
-        )
-        block_attn = (
-            (
-                block_mask.repeat_interleave(block_size, dim=0)
-                .repeat_interleave(block_size, dim=1)
-                .unsqueeze(0)
-                .unsqueeze(0)
-            )
-            .log()
-            .to(torch.bfloat16)
-        )
+        num_blocks = (max_new_tokens + block_size - 1) // block_size
 
-        position_ids = torch.arange(total_len, device=self.model.device).unsqueeze(0)
-
-        x = torch.full(
-            (B, total_len), mask_id, dtype=torch.long, device=self.model.device,
-        )
+        # ── Canvas: EOS-padded, with prompt + mask tail ──
+        x = torch.full((B, T), eos_id, dtype=torch.long, device=self.model.device)
         for i, p in enumerate(inputs):
-            x[i, :prompt_len] = p
+            x[i, :prompt_lens[i]] = p
+            x[i, prompt_lens[i]:prompt_lens[i] + max_new_tokens] = mask_id
+
+        # 2-D attention mask (B, T)
+        attention_mask = torch.zeros((B, T), dtype=torch.long, device=self.model.device)
+        for i, pl in enumerate(prompt_lens):
+            valid_end = min(pl + max_new_tokens, T)
+            attention_mask[i, :valid_end] = 1
 
         if cfg_scale > 0.0:
-            unmasked_index = torch.zeros(
-                (B, total_len), dtype=torch.bool, device=self.model.device
-            )
-            unmasked_index[:, :prompt_len] = True
+            unmasked_index = (x != mask_id) & attention_mask.bool()
         else:
             unmasked_index = None
 
         histories = [x.clone()] if return_dict else None
         global_step = 0
 
-        for blk in range(prompt_blocks, num_blocks):
-            blk_start = blk * block_size
-            window_end = (blk + 1) * block_size
-            cur_attn = block_attn[:, :, :window_end, :window_end]
-            cur_pos = position_ids[:, :window_end]
+        for blk in range(num_blocks):
+            # Block boundaries relative to the longest prompt
+            max_prompt = max(prompt_lens)
+            blk_start = max_prompt + blk * block_size
+            window_end = min(blk_start + block_size, T)
+            actual_block_size = window_end - blk_start
 
             prompt_mask_in_block = torch.zeros(
-                block_size, dtype=torch.bool, device=self.model.device
+                actual_block_size, dtype=torch.bool, device=self.model.device
             )
-            if blk_start < prompt_len:
-                prompt_mask_in_block[: min(prompt_len - blk_start, block_size)] = True
+            # If prompt extends into this block, mark those positions
+            for i in range(B):
+                if prompt_lens[i] > blk_start:
+                    end = min(prompt_lens[i] - blk_start, actual_block_size)
+                    prompt_mask_in_block[:end] = True
 
-            def forward_fn(_we=window_end, _ca=cur_attn, _cp=cur_pos):
+            def forward_fn(_bs=blk_start, _abs=actual_block_size):
                 if cfg_scale > 0.0:
-                    unmasked_index[:, blk_start:_we] = (
-                        x[:, blk_start:_we] != mask_id
+                    unmasked_index[:, _bs:_bs + _abs] = (
+                        x[:, _bs:_bs + _abs] != mask_id
                     )
                 return block_forward(
-                    self.model, x, _we, block_size, _ca, _cp,
+                    self.model, x, _bs, _abs, attention_mask,
                     cfg_scale, unmasked_index, suppress_tokens, mask_id,
                 )
 
-            for gen_step in range(block_size):
+            for gen_step in range(actual_block_size):
                 block_slice = x[:, blk_start:window_end]
                 active_mask = block_slice == mask_id
                 if not active_mask.any():
@@ -484,27 +486,25 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
                     and (global_step + 1) % edit_freq == 0
                     and gen_step >= edit_start
                     and edit_step > 0
-                    and blk - prompt_blocks >= skip_blocks
+                    and blk >= skip_blocks
                 ):
                     if edit_strategy == "proseco_eval":
-                        _asize = window_end - prompt_len
+                        _as = max_prompt
+                        _asize = window_end - _as
 
-                        def active_fwd(
-                            _we=window_end, _ca=cur_attn, _cp=cur_pos,
-                            _asize=_asize,
-                        ):
+                        def active_fwd(_as=_as, _asize=_asize):
                             if cfg_scale > 0.0:
-                                unmasked_index[:, prompt_len:_we] = (
-                                    x[:, prompt_len:_we] != mask_id
+                                unmasked_index[:, _as:_as + _asize] = (
+                                    x[:, _as:_as + _asize] != mask_id
                                 )
                             return block_forward(
-                                self.model, x, _we, _asize, _ca, _cp,
+                                self.model, x, _as, _asize, attention_mask,
                                 cfg_scale, unmasked_index, suppress_tokens,
                                 mask_id,
                             )
 
                         logits_block = proseco_correct(
-                            x, prompt_len, blk_start, window_end,
+                            x, max_prompt, blk_start, window_end,
                             logits_block, mask_id, edit_step, active_fwd,
                         )
                     else:
@@ -581,7 +581,8 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
                         prev_block = new_block.clone()
 
             if eos_early_stop and eos_id is not None:
-                generated_part = x[:, prompt_len:window_end]
+                # Check if all samples have completed (no masks + has EOS)
+                generated_part = x[:, max_prompt:window_end]
                 has_no_masks = (generated_part == mask_id).sum(dim=1) == 0
                 has_eos = (generated_part == eos_id).any(dim=1)
                 if (has_no_masks & has_eos).all():

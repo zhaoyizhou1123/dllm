@@ -29,6 +29,7 @@ class MDLMSamplerConfig(BaseSamplerConfig):
     suppress_tokens: list[int] | None = None
     begin_suppress_tokens: list[int] | None = None
     right_shift_logits: bool = False
+    eos_early_stop: bool = False
 
 
 @dataclass
@@ -75,6 +76,7 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+        eos_early_stop = kwargs.get("eos_early_stop", config.eos_early_stop)
 
         assert 1 <= block_size
         assert 1 <= steps
@@ -195,7 +197,7 @@ class MDLMSampler(BaseSampler):
 
                 # Per-position confidence used to pick which masks to commit this step
                 if remasking == "low_confidence":
-                    p = F.softmax(logits, dim=-1)
+                    p = F.softmax(logits.to(torch.float64), dim=-1)
                     x0_p = torch.squeeze(
                         torch.gather(p, dim=-1, index=torch.unsqueeze(x0, -1)), -1
                     )  # [B, T] confidence of predicted token
@@ -230,6 +232,23 @@ class MDLMSampler(BaseSampler):
                 x[transfer_index] = x0[transfer_index]
                 if histories is not None:
                     histories.append(x.clone())
+
+            # ----- EOS early stopping: break outer block loop -----
+            if eos_early_stop and eos_id is not None:
+                all_done = True
+                for j in range(B):
+                    blk_start_j = prompt_lens[j] + b * block_size
+                    blk_end_j = min(prompt_lens[j] + (b + 1) * block_size, T)
+                    generated = x[j, blk_start_j:blk_end_j]
+                    if not (
+                        (generated == mask_id).sum() == 0
+                        and (generated == eos_id).any()
+                    ):
+                        all_done = False
+                        break
+                if all_done:
+                    x[x == mask_id] = eos_id
+                    break
 
         # ----- Output format -----
         if not return_dict:
@@ -269,6 +288,7 @@ class MDLMSampler(BaseSampler):
         begin_suppress_tokens = kwargs.get(
             "begin_suppress_tokens", config.begin_suppress_tokens
         )
+        eos_early_stop = kwargs.get("eos_early_stop", config.eos_early_stop)
 
         mask_id = self.tokenizer.mask_token_id
         bos_id = self.tokenizer.bos_token_id
@@ -384,7 +404,7 @@ class MDLMSampler(BaseSampler):
 
                 # Confidence used for choosing which masks to commit this step
                 if remasking == "low_confidence":
-                    p = F.softmax(logits, dim=-1)
+                    p = F.softmax(logits.to(torch.float64), dim=-1)
                     x0_p = torch.gather(p, dim=-1, index=x0.unsqueeze(-1)).squeeze(
                         -1
                     )  # [B, T]
@@ -416,6 +436,26 @@ class MDLMSampler(BaseSampler):
                 x[transfer_index] = x0[transfer_index]
                 if histories is not None:
                     histories.append(x.clone())
+
+            # ----- EOS early stopping: break outer block loop -----
+            if eos_early_stop and eos_id is not None:
+                all_done = True
+                for j in range(B):
+                    width = widths[j]
+                    if width > 0:
+                        generated = x[j, start:start + width]
+                        if not (
+                            (generated == mask_id).sum() == 0
+                            and (generated == eos_id).any()
+                        ):
+                            all_done = False
+                            break
+                    else:
+                        all_done = False
+                        break
+                if all_done:
+                    x[x == mask_id] = eos_id
+                    break
 
         # ----- Output format -----
         if not return_dict:
