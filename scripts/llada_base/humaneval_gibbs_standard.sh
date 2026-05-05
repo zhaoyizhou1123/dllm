@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=eval_proseco_gibbs_edit_bidir_humaneval_notemplate
+#SBATCH --job-name=eval_llada_base_gibbs_standard_humaneval
 #SBATCH --output=slurm/%x/job_%A_%a.out
 #SBATCH --array=0-6
 #SBATCH --nodes=1
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-model_name_or_path="kuleshov-group/proseco-llada-sft"
+model_name_or_path="GSAI-ML/LLaDA-8B-Base"
 max_new_tokens=256
 steps=256
 block_size=32
@@ -27,10 +27,10 @@ edit_freq=1
 edit_start=32
 edit_step_sweep=(1 2 4 8 16 32 64)
 edit_step="${edit_step_sweep[${SLURM_ARRAY_TASK_ID:-0}]}"
-edit_strategy="gibbs_edit"
+edit_strategy="gibbs_standard"
 remasking_strategy="random"
 num_workers=4
-output_dir="results/proseco_humaneval_len${max_new_tokens}_notemplate/gibbs_edit_bidir_block${block_size}_steps${steps}_editstep${edit_step}_editstart${edit_start}_global-earlyexit"
+output_dir="results/llada_base_humaneval_len${max_new_tokens}/gibbs_standard_block${block_size}_steps${steps}_editstep${edit_step}_editstart${edit_start}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -45,9 +45,9 @@ while [[ $# -gt 0 ]]; do
     --edit_step)          edit_step="$2";           shift 2 ;;
     --edit_start)         edit_start="$2";          shift 2 ;;
     --edit_strategy)      edit_strategy="$2";       shift 2 ;;
-    --remasking_strategy)  remasking_strategy="$2";  shift 2 ;;
-    --num_workers)         num_workers="$2";         shift 2 ;;
-    --output_dir)          output_dir="$2";          shift 2 ;;
+    --remasking_strategy) remasking_strategy="$2";  shift 2 ;;
+    --num_workers)        num_workers="$2";         shift 2 ;;
+    --output_dir)         output_dir="$2";          shift 2 ;;
     --limit)              limit="$2";               shift 2 ;;
     --offset)             offset="$2";              shift 2 ;;
     *) echo "Error: Unknown argument: $1" >&2; exit 1 ;;
@@ -55,7 +55,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "${output_dir}" ]]; then
-  output_dir="results/proseco_humaneval_len${max_new_tokens}/gibbs_edit_bidir_block${block_size}_steps${steps}_editstep${edit_step}"
+  output_dir="results/llada_base_humaneval_len${max_new_tokens}/gibbs_standard_block${block_size}_steps${steps}_editstep${edit_step}_editstart${edit_start}"
 fi
 
 echo "===== Eval settings ====="

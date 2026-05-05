@@ -30,11 +30,13 @@ Slurm users
 import os
 from dataclasses import dataclass, field
 from functools import partial
+from typing import Optional
 
 import accelerate
 import transformers
 
 import dllm
+from dllm.data.rstar_coder import split_rstar_coder
 
 logger = dllm.utils.get_default_logger(__name__)
 
@@ -51,6 +53,11 @@ class DataArguments(dllm.utils.DataArguments):
     mask_prompt_loss: bool = field(
         default=True,
         metadata={"help": "Whether to mask the loss on the prompt tokens"},
+    )
+    data_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Path to pre-tokenized binary data dir (e.g. rstar_coder). "
+                  "When set, --dataset_args is ignored."},
     )
 
 
@@ -79,46 +86,63 @@ def train():
     tokenizer = dllm.utils.get_tokenizer(model_args=model_args)
 
     # ----- Dataset ----------------------------------------------------------------
-    with accelerate.PartialState().local_main_process_first():
-        dataset = dllm.data.load_sft_dataset(
-            data_args.dataset_args,
-            load_preprocessed_data=data_args.load_preprocessed_data,
-        )
-        if not data_args.load_preprocessed_data:
-            map_fn = partial(
-                dllm.utils.default_sft_map_fn,
-                tokenizer=tokenizer,
-                mask_prompt_loss=data_args.mask_prompt_loss,
+    if data_args.data_dir is not None:
+        # Pre-tokenized binary data (e.g. rstar_coder memmap format).
+        # RStarCoderDataset returns {labels, prompt_mask}; wrap to produce
+        # {input_ids, labels} with -100 at prompt positions for MDLMTrainer.
+        train_data, val_data = split_rstar_coder(data_args.data_dir)
+        dataset = {"train": train_data, "test": val_data}
+    else:
+        with accelerate.PartialState().local_main_process_first():
+            dataset = dllm.data.load_sft_dataset(
+                data_args.dataset_args,
+                load_preprocessed_data=data_args.load_preprocessed_data,
             )
-            dataset = dataset.map(
-                map_fn,
-                num_proc=data_args.num_proc,
-                desc="Mapping dataset to SFT format",
-            )
-        # truncate / filter long sequences if needed
-        dataset = dllm.utils.post_process_dataset(dataset, data_args)
+            if not data_args.load_preprocessed_data:
+                map_fn = partial(
+                    dllm.utils.default_sft_map_fn,
+                    tokenizer=tokenizer,
+                    mask_prompt_loss=data_args.mask_prompt_loss,
+                )
+                dataset = dataset.map(
+                    map_fn,
+                    num_proc=data_args.num_proc,
+                    desc="Mapping dataset to SFT format",
+                )
+            # truncate / filter long sequences if needed
+            dataset = dllm.utils.post_process_dataset(dataset, data_args)
 
     # ----- Training --------------------------------------------------------------
     accelerate.PartialState().wait_for_everyone()
     logger.info("Start training...")
+
+    if data_args.data_dir is not None:
+        # rstar_coder data: collator converts {labels, prompt_mask} →
+        # {input_ids, labels} with -100 at prompt positions.
+        from dllm.utils.collators import RStarCoderCollator
+        data_collator = RStarCoderCollator(
+            pad_token_id=tokenizer.pad_token_id,
+            mask_prompt_loss=data_args.mask_prompt_loss,
+        )
+    else:
+        data_collator = dllm.utils.NoAttentionMaskWrapper(
+            transformers.DataCollatorForSeq2Seq(
+                tokenizer,
+                return_tensors="pt",
+                padding=True,
+                label_pad_token_id=tokenizer.pad_token_id,
+            ),
+        )
+
     trainer = dllm.core.trainers.MDLMTrainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=dataset["train"],
         eval_dataset=dataset.get("test", None),
         args=training_args,
-        data_collator=(
-            dllm.utils.NoAttentionMaskWrapper(  # padded <eos_token> should be visible
-                transformers.DataCollatorForSeq2Seq(
-                    tokenizer,
-                    return_tensors="pt",
-                    padding=True,
-                    label_pad_token_id=tokenizer.pad_token_id,  # finetune on padded <eos_token>
-                ),
-            )
-        ),
+        data_collator=data_collator,
     )
-    trainer.train()
+    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
     trainer.save_model(os.path.join(training_args.output_dir, "checkpoint-final"))
     trainer.processing_class.save_pretrained(
         os.path.join(training_args.output_dir, "checkpoint-final")

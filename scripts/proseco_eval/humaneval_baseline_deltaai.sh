@@ -20,7 +20,7 @@ steps=256
 temperature=0.0
 batch_size=1
 limit=""
-output_dir="results/proseco_humaneval_len${max_new_tokens}/baseline"
+output_dir="results/proseco_humaneval_len${max_new_tokens}_notemplate/baseline"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -73,7 +73,7 @@ fi
 
 python dllm/pipelines/llada/eval.py \
     --tasks humaneval --num_fewshot 0 \
-    --model llada --apply_chat_template \
+    --model llada \
     --batch_size "${batch_size}" \
     --model_args "pretrained=${model_name_or_path},max_new_tokens=${max_new_tokens},block_size=${block_size},steps=${steps},temperature=${temperature},remasking=low_confidence,eos_early_stop=True,begin_suppress_tokens=[]" \
     --confirm_run_unsafe_code \

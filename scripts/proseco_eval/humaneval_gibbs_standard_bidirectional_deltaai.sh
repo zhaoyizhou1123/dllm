@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=eval_proseco_gibbs_standard_bidir_humaneval
+#SBATCH --job-name=eval_proseco_gibbs_standard_bidir_humaneval_notemplate
 #SBATCH --output=slurm/%x/job_%A_%a.out
 #SBATCH --array=0-6
 #SBATCH --nodes=1
@@ -24,13 +24,13 @@ batch_size=1
 limit=""
 offset=""
 edit_freq=1
-edit_start=64
+edit_start=32
 edit_step_sweep=(1 2 4 8 16 32 64)
 edit_step="${edit_step_sweep[${SLURM_ARRAY_TASK_ID:-0}]}"
 edit_strategy="gibbs_standard"
 remasking_strategy="random"
 num_workers=4
-output_dir="results/proseco_humaneval_len${max_new_tokens}_final/gibbs_standard_bidir_block${block_size}_steps${steps}_editstep${edit_step}_editstart${edit_start}_global-earlyexit"
+output_dir="results/proseco_humaneval_len${max_new_tokens}_notemplate/gibbs_standard_bidir_block${block_size}_steps${steps}_editstep${edit_step}_editstart${edit_start}_global-earlyexit"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -101,7 +101,7 @@ fi
 
 python dllm/pipelines/llada/eval.py \
     --tasks humaneval --num_fewshot 0 \
-    --model llada_gibbs --apply_chat_template \
+    --model llada_gibbs \
     --batch_size "${batch_size}" \
     --model_args "pretrained=${model_name_or_path},max_new_tokens=${max_new_tokens},steps=${steps},block_size=${block_size},temperature=${temperature},eos_early_stop=True,cfg_scale=0.0,remasking=${remasking},begin_suppress_tokens=[],edit_freq=${edit_freq},edit_step=${edit_step},edit_start=${edit_start},edit_strategy=${edit_strategy},remasking_strategy=${remasking_strategy},early_exit_number=1,num_workers=${num_workers},output_dir=${output_dir}" \
     --confirm_run_unsafe_code \

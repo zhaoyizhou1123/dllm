@@ -15,6 +15,7 @@ from .collators import (
     NoAttentionMaskWrapper,
     PrependBOSWrapper,
     RandomTruncateWrapper,
+    RStarCoderCollator,
 )
 from .configs import DataArguments, ModelArguments, TrainingArguments
 from .data import (
@@ -69,6 +70,7 @@ __all__ = [
     "NoAttentionMaskWrapper",
     "PrependBOSWrapper",
     "RandomTruncateWrapper",
+    "RStarCoderCollator",
     # configs
     "DataArguments",
     "ModelArguments",

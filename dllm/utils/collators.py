@@ -174,6 +174,32 @@ class RandomTruncateWrapper(CollatorWrapper):
         return outputs
 
 
+@dataclass
+class RStarCoderCollator:
+    """
+    Collator for pre-tokenized rstar_coder binary data.
+
+    Expects each sample to have:
+        - labels: LongTensor[max_len]  (token IDs)
+        - prompt_mask: BoolTensor[max_len]  (True = prompt token)
+
+    Produces a batch with:
+        - input_ids: LongTensor[B, max_len]
+        - labels: LongTensor[B, max_len]  (prompt positions set to -100 if mask_prompt_loss)
+    """
+
+    pad_token_id: int = 0
+    mask_prompt_loss: bool = True
+
+    def __call__(self, features, return_tensors=None):
+        input_ids = torch.stack([f["labels"] for f in features])
+        labels = input_ids.clone()
+        if self.mask_prompt_loss:
+            prompt_mask = torch.stack([f["prompt_mask"] for f in features])
+            labels[prompt_mask] = -100
+        return {"input_ids": input_ids, "labels": labels}
+
+
 if __name__ == "__main__":
     # Load tokenizer
     tokenizer = transformers.AutoTokenizer.from_pretrained("t5-small")
