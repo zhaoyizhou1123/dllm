@@ -38,6 +38,12 @@ def main():
         default=4,
         help="Number of parallel workers for code execution (default: 4)",
     )
+    parser.add_argument(
+        "--plus_parquet",
+        default="local_data/humanevalplus/test.parquet",
+        help="Local HumanEval+ parquet (staged from evalplus/humanevalplus; "
+        "cluster HF is offline). Must have columns task_id/entry_point/test.",
+    )
     args = parser.parse_args()
 
     # Enable code execution
@@ -55,12 +61,13 @@ def main():
             f"WARNING: Only {len(samples)} of 164 samples present", file=sys.stderr
         )
 
-    # Load HumanEval+ dataset
-    from datasets import load_dataset
+    # Load HumanEval+ dataset from the staged local parquet (HF is blocked on-cluster).
+    import pandas as pd
 
-    ds_plus = load_dataset("evalplus/humanevalplus", split="test")
-    plus_lookup = {row["task_id"]: row for row in ds_plus}
-    print(f"Loaded HumanEval+ dataset with {len(plus_lookup)} problems")
+    plus_df = pd.read_parquet(args.plus_parquet)
+    plus_lookup = {row["task_id"]: row for _, row in plus_df.iterrows()}
+    print(f"Loaded HumanEval+ dataset with {len(plus_lookup)} problems "
+          f"from {args.plus_parquet}")
 
     # Build aligned predictions and references
     predictions = []

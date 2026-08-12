@@ -21,6 +21,10 @@ from dllm.pipelines.llada21 import (
     LLaDA21ConfidenceBlockSamplerConfig,
     LLaDA21GibbsBlockSampler,
     LLaDA21GibbsBlockSamplerConfig,
+    LLaDA21ProSeCoBlockSampler,
+    LLaDA21ProSeCoBlockSamplerConfig,
+    LLaDA21ReMDMBlockSampler,
+    LLaDA21ReMDMBlockSamplerConfig,
     LLaDA21Sampler,
     LLaDA21SamplerConfig,
 )
@@ -165,6 +169,78 @@ class LLaDA21ConfidenceBlockEvalHarness(BaseEvalHarness):
     ):
         eval_config = eval_config or LLaDA21ConfidenceBlockEvalConfig()
         sampler_config = sampler_config or LLaDA21ConfidenceBlockEvalSamplerConfig()
+
+        super().__init__(
+            eval_config=eval_config,
+            sampler_config=sampler_config,
+            sampler_cls=sampler_cls,
+            **kwargs,
+        )
+
+
+@dataclass
+class LLaDA21ReMDMBlockEvalSamplerConfig(LLaDA21ReMDMBlockSamplerConfig):
+    max_new_tokens: int = 512
+    block_size: int = 32
+    variant: str = "cap"
+    eta: float = 0.4
+    edit_step: int = 0
+    early_exit_number: int = 5
+    temperature: float = 0.0
+    eos_early_stop: bool = True
+
+
+@dataclass
+class LLaDA21ReMDMBlockEvalConfig(BaseEvalConfig):
+    batch_size: int = 1
+
+
+@register_model("llada21_remdm")
+class LLaDA21ReMDMBlockEvalHarness(BaseEvalHarness):
+    def __init__(
+        self,
+        eval_config: LLaDA21ReMDMBlockEvalConfig | None = None,
+        sampler_config: LLaDA21ReMDMBlockSamplerConfig | None = None,
+        sampler_cls: type[LLaDA21ReMDMBlockSampler] = LLaDA21ReMDMBlockSampler,
+        **kwargs,
+    ):
+        eval_config = eval_config or LLaDA21ReMDMBlockEvalConfig()
+        sampler_config = sampler_config or LLaDA21ReMDMBlockEvalSamplerConfig()
+
+        super().__init__(
+            eval_config=eval_config,
+            sampler_config=sampler_config,
+            sampler_cls=sampler_cls,
+            **kwargs,
+        )
+
+
+@dataclass
+class LLaDA21ProSeCoBlockEvalSamplerConfig(LLaDA21ProSeCoBlockSamplerConfig):
+    max_new_tokens: int = 512
+    block_size: int = 32
+    unmasking_num: int = 1
+    correction_step: int = 0
+    temperature: float = 0.0
+    eos_early_stop: bool = True
+
+
+@dataclass
+class LLaDA21ProSeCoBlockEvalConfig(BaseEvalConfig):
+    batch_size: int = 1
+
+
+@register_model("llada21_proseco")
+class LLaDA21ProSeCoBlockEvalHarness(BaseEvalHarness):
+    def __init__(
+        self,
+        eval_config: LLaDA21ProSeCoBlockEvalConfig | None = None,
+        sampler_config: LLaDA21ProSeCoBlockSamplerConfig | None = None,
+        sampler_cls: type[LLaDA21ProSeCoBlockSampler] = LLaDA21ProSeCoBlockSampler,
+        **kwargs,
+    ):
+        eval_config = eval_config or LLaDA21ProSeCoBlockEvalConfig()
+        sampler_config = sampler_config or LLaDA21ProSeCoBlockEvalSamplerConfig()
 
         super().__init__(
             eval_config=eval_config,

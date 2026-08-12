@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 import dllm
 from dllm.core.samplers import BaseSampler, BaseSamplerConfig
+from dllm.core.samplers.base import BaseSamplerOutput
 from dllm.utils.configs import ModelArguments
 
 
@@ -140,20 +141,28 @@ class BaseEvalHarness(LM):
 
     # ── Unified generate_until scaffolding ────────────────────────────
 
-    def _save_generation(self, request: Instance, answer: str) -> None:
+    def _save_generation(
+        self,
+        request: Instance,
+        answer: str,
+        nfe: int | None = None,
+        gen_time_s: float | None = None,
+    ) -> None:
         """Append a completed generation to the incremental JSONL log."""
         if self.output_dir is None:
             return
         path = os.path.join(self.output_dir, "generations.jsonl")
-        line = json.dumps(
-            {
-                "doc_id": request.doc_id,
-                "task_name": request.task_name,
-                "context": request.args[0],
-                "generated": answer,
-            },
-            ensure_ascii=False,
-        )
+        record = {
+            "doc_id": request.doc_id,
+            "task_name": request.task_name,
+            "context": request.args[0],
+            "generated": answer,
+        }
+        if nfe is not None:
+            record["nfe"] = nfe
+        if gen_time_s is not None:
+            record["gen_time_s"] = gen_time_s
+        line = json.dumps(record, ensure_ascii=False)
         with open(path, "a", encoding="utf-8") as f:
             f.write(line + "\n")
 
@@ -174,7 +183,53 @@ class BaseEvalHarness(LM):
                 cache[entry["doc_id"]] = entry["generated"]
         return cache
 
-    def _process_request(self, request: Instance, stream) -> str:
+    def _run_sampler(self, prompts: list[torch.Tensor]):
+        """Run the sampler and return (sequences, nfe_list, elapsed_s).
+
+        Capability-gated: only samplers that set `supports_nfe = True` take the
+        return-dict path (which also captures the per-sample NFE). Every other
+        sampler hits the exact same tensor-returning call as before, with
+        nfe_list=None. `return_histories=False` avoids the per-step history
+        snapshots which the eval path never consumes.
+
+        `elapsed_s` is the CUDA-synchronized wall time of the sample() call (for
+        the whole prompt batch). Callers divide by the batch size for a per-sample
+        estimate. NOTE: this is an accurate isolated-latency measurement only at
+        num_workers=1; under the parallel path (multiple CUDA streams) concurrent
+        calls overlap on the device and each call's wall time is inflated.
+        """
+        import time
+
+        device_is_cuda = self.device.type == "cuda"
+        if device_is_cuda:
+            torch.cuda.synchronize(self.device)
+        t0 = time.perf_counter()
+
+        if getattr(self.sampler, "supports_nfe", False):
+            out = self.sampler.sample(
+                inputs=prompts,
+                config=self.sampler_config,
+                return_dict=True,
+                return_histories=False,
+            )
+            if isinstance(out, BaseSamplerOutput):
+                seqs, nfe = out.sequences, out.nfe
+            else:
+                seqs, nfe = out, None
+        else:
+            seqs = self.sampler.sample(
+                inputs=prompts,
+                config=self.sampler_config,
+                return_dict=False,
+            )
+            nfe = None
+
+        if device_is_cuda:
+            torch.cuda.synchronize(self.device)
+        elapsed_s = time.perf_counter() - t0
+        return seqs, nfe, elapsed_s
+
+    def _process_request(self, request: Instance, stream) -> tuple[str, int | None, float]:
         """Process a single generation request, optionally on a dedicated CUDA stream."""
         ctx = torch.cuda.stream(stream) if stream is not None else nullcontext()
         with torch.no_grad(), ctx:
@@ -184,11 +239,7 @@ class BaseEvalHarness(LM):
                 device=self.device,
                 dtype=torch.long,
             )
-            generated_ids = self.sampler.sample(
-                inputs=[prompt],
-                config=self.sampler_config,
-                return_dict=False,
-            )
+            generated_ids, nfe_list, elapsed_s = self._run_sampler([prompt])
             answer = dllm.utils.sample_trim(
                 self.tokenizer,
                 generated_ids.tolist(),
@@ -197,7 +248,8 @@ class BaseEvalHarness(LM):
             for stop_seq in gen_kwargs["until"]:
                 if stop_seq in answer:
                     answer = answer.split(stop_seq)[0]
-            return answer
+            nfe = nfe_list[0] if nfe_list is not None else None
+            return answer, nfe, elapsed_s
 
     @torch.no_grad()
     def generate_until(self, requests: list[Instance]) -> list[str]:
@@ -242,22 +294,24 @@ class BaseEvalHarness(LM):
                 for ctx in contexts
             ]
 
-            generated_ids = self.sampler.sample(
-                inputs=prompts,
-                config=self.sampler_config,
-                return_dict=False,
-            )
+            generated_ids, nfe_list, elapsed_s = self._run_sampler(prompts)
             generated_answers = dllm.utils.sample_trim(
                 self.tokenizer,
                 generated_ids.tolist(),
                 [p.tolist() for p in prompts],
             )
+            # Per-sample wall time: split the batch-call time evenly across the
+            # batch (exact at batch_size=1, an even-split estimate otherwise).
+            per_sample_time = elapsed_s / max(len(batch), 1)
 
-            for inst, answer, gen_kwargs in zip(batch, generated_answers, gen_kwargs_list):
+            for i, (inst, answer, gen_kwargs) in enumerate(
+                zip(batch, generated_answers, gen_kwargs_list)
+            ):
                 for stop_seq in gen_kwargs["until"]:
                     if stop_seq in answer:
                         answer = answer.split(stop_seq)[0]
-                self._save_generation(inst, answer)
+                nfe = nfe_list[i] if nfe_list is not None else None
+                self._save_generation(inst, answer, nfe, per_sample_time)
                 out.append(answer)
 
             if self.accelerator is not None:
@@ -283,8 +337,8 @@ class BaseEvalHarness(LM):
 
             for future in tqdm(as_completed(futures), total=len(requests), desc="Generating..."):
                 idx = futures[future]
-                answer = future.result()
-                self._save_generation(requests[idx], answer)
+                answer, nfe, gen_time_s = future.result()
+                self._save_generation(requests[idx], answer, nfe, gen_time_s)
                 results[idx] = answer
 
         return results

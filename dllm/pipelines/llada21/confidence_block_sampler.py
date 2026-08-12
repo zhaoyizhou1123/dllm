@@ -48,6 +48,8 @@ class LLaDA21ConfidenceBlockSamplerConfig(BaseSamplerConfig):
 
 @dataclass
 class LLaDA21ConfidenceBlockSampler(BaseSampler):
+    supports_nfe = True
+
     @torch.no_grad()
     def sample(
         self,
@@ -70,6 +72,7 @@ class LLaDA21ConfidenceBlockSampler(BaseSampler):
         cfg_scale = kwargs.get("cfg_scale", config.cfg_scale)
         suppress_tokens = kwargs.get("suppress_tokens", config.suppress_tokens)
         return_dict = kwargs.get("return_dict", config.return_dict)
+        return_histories = kwargs.get("return_histories", return_dict)
         edit_freq = int(kwargs.get("edit_freq", config.edit_freq))
         edit_step = int(kwargs.get("edit_step", config.edit_step))
         edit_start = int(kwargs.get("edit_start", config.edit_start))
@@ -135,8 +138,9 @@ class LLaDA21ConfidenceBlockSampler(BaseSampler):
         else:
             unmasked_index = None
 
-        histories = [x.clone()] if return_dict else None
+        histories = [x.clone()] if return_histories else None
         global_step = 0
+        nfe_counter = [0]  # counts every model forward (main + gibbs_correct + post-edit)
 
         for blk in range(prompt_blocks, num_blocks):
             blk_start = blk * block_size
@@ -151,6 +155,7 @@ class LLaDA21ConfidenceBlockSampler(BaseSampler):
                 prompt_mask_in_block[: min(prompt_len - blk_start, block_size)] = True
 
             def forward_fn(_we=window_end, _ca=cur_attn, _cp=cur_pos):
+                nfe_counter[0] += 1
                 if cfg_scale > 0.0:
                     unmasked_index[:, blk_start:_we] = (
                         x[:, blk_start:_we] != mask_id
@@ -216,7 +221,13 @@ class LLaDA21ConfidenceBlockSampler(BaseSampler):
                 global_step += 1
 
             # -- Post-editing: refine non-prompt tokens without remasking --
-            if edit_step > 0:
+            # gibbs_standard uses R2D carry-over (ReMDM SUBS) semantics: committed
+            # tokens must stay sticky and correction is performed inside the corrector
+            # during generation (remask + carry-over refill). This resample-all pass
+            # overwrites every non-prompt token each iteration -> it re-predicts
+            # committed tokens and breaks carry-over. Skip it for gibbs_standard so
+            # carry-over is strictly enforced; edit variants keep the pass unchanged.
+            if edit_step > 0 and edit_strategy != "gibbs_standard":
                 non_prompt = ~prompt_mask_in_block.unsqueeze(0).expand(B, -1)
                 prev_block = None
                 consecutive_unchanged = 0
@@ -253,7 +264,7 @@ class LLaDA21ConfidenceBlockSampler(BaseSampler):
 
         if not return_dict:
             return x
-        return BaseSamplerOutput(sequences=x, histories=histories)
+        return BaseSamplerOutput(sequences=x, histories=histories, nfe=[nfe_counter[0]] * B)
 
     @torch.no_grad()
     def infill(self, inputs, config=None, **kwargs):

@@ -48,6 +48,8 @@ class LLaDA21BlockSamplerConfig(BaseSamplerConfig):
 
 @dataclass
 class LLaDA21BlockSampler(BaseSampler):
+    supports_nfe = True
+
     @torch.no_grad()
     def sample(
         self,
@@ -88,6 +90,7 @@ class LLaDA21BlockSampler(BaseSampler):
         cfg_scale = kwargs.get("cfg_scale", config.cfg_scale)
         suppress_tokens = kwargs.get("suppress_tokens", config.suppress_tokens)
         return_dict = kwargs.get("return_dict", config.return_dict)
+        return_histories = kwargs.get("return_histories", return_dict)
 
         mask_id = self.tokenizer.mask_token_id
         eos_id = self.tokenizer.eos_token_id
@@ -155,7 +158,8 @@ class LLaDA21BlockSampler(BaseSampler):
             )
             unmasked_index[:, :prompt_len] = True
 
-        histories = [x.clone()] if return_dict else None
+        histories = [x.clone()] if return_histories else None
+        nfe_count = 0
 
         # ----- Block loop -----
         for blk in range(prompt_blocks, num_blocks):
@@ -208,6 +212,7 @@ class LLaDA21BlockSampler(BaseSampler):
                     ).logits
 
                 logits_block = logits[:, -block_size:, :]
+                nfe_count += 1
 
                 if suppress_tokens is not None and len(suppress_tokens) > 0:
                     for token_id in suppress_tokens:
@@ -267,7 +272,7 @@ class LLaDA21BlockSampler(BaseSampler):
 
         if not return_dict:
             return x
-        return BaseSamplerOutput(sequences=x, histories=histories)
+        return BaseSamplerOutput(sequences=x, histories=histories, nfe=[nfe_count] * B)
 
     @torch.no_grad()
     def infill(

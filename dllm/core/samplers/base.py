@@ -11,6 +11,10 @@ from dllm.core.schedulers import BaseAlphaScheduler, LinearAlphaScheduler
 class BaseSamplerOutput:
     sequences: torch.Tensor
     histories: list[torch.Tensor] | None = None
+    # Per-sample number of function evaluations (model forward passes). Populated
+    # only by samplers that set `supports_nfe = True`; None otherwise so existing
+    # samplers/readers are unaffected.
+    nfe: list[int] | None = None
 
 
 @dataclass

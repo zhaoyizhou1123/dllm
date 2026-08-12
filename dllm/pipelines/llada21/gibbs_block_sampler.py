@@ -552,7 +552,12 @@ class LLaDA21GibbsBlockSampler(BaseSampler):
                 global_step += 1
 
             # -- Post-editing: refine non-prompt tokens without remasking --
-            if edit_step > 0:
+            # gibbs_standard uses R2D carry-over (ReMDM SUBS) semantics: committed
+            # tokens must stay sticky and correction is performed inside the corrector
+            # during generation. This resample-all pass overwrites every non-prompt
+            # token each iteration -> it breaks carry-over. Skip it for gibbs_standard;
+            # edit variants keep the pass unchanged.
+            if edit_step > 0 and edit_strategy != "gibbs_standard":
                 non_prompt = ~prompt_mask_in_block.unsqueeze(0).expand(B, -1)
                 prev_block = None
                 consecutive_unchanged = 0
