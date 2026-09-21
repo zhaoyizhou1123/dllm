@@ -113,6 +113,8 @@ class BaseEvalHarness(LM):
         self.num_workers = int(kwargs.get("num_workers", 1))
         self.output_dir = kwargs.get("output_dir", None)
         self.reuse = kwargs.get("reuse", False)
+        # Discarded warmup decodes before the first timed sample (0 = off).
+        self.warmup = int(kwargs.get("warmup", 0))
 
     @property
     def rank(self) -> int:
@@ -266,6 +268,7 @@ class BaseEvalHarness(LM):
             uncached = requests
 
         if uncached:
+            self._warmup(uncached[0])
             if self.num_workers > 1:
                 uncached_results = self._generate_until_parallel(uncached)
             else:
@@ -275,6 +278,33 @@ class BaseEvalHarness(LM):
             gen_map = {}
 
         return [cache.get(r.doc_id) or gen_map.get(r.doc_id) for r in requests]
+
+    def _warmup(self, request: Instance) -> None:
+        """Run `self.warmup` untimed, unsaved decodes of one block of `request`.
+
+        Absorbs CUDA context / cuBLAS / allocator warmup so the first timed sample
+        is not inflated. Correction passes are disabled (edit_step / correction_step
+        = 0): they reuse the same forward kernels, so they add cost but no warmup.
+        """
+        if self.warmup <= 0:
+            return
+        prompt = torch.tensor(
+            self.tokenizer(request.args[0])["input_ids"],
+            device=self.device,
+            dtype=torch.long,
+        )
+        block_size = getattr(self.sampler_config, "block_size", 32)
+        for _ in range(self.warmup):
+            self.sampler.sample(
+                inputs=[prompt],
+                config=self.sampler_config,
+                return_dict=False,
+                max_new_tokens=block_size,
+                edit_step=0,
+                correction_step=0,
+            )
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
 
     def _generate_until_sequential(self, requests: list[Instance]) -> list[str]:
         out: list[str] = []

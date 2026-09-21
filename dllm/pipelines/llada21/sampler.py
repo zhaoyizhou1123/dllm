@@ -88,6 +88,8 @@ class LLaDA21SamplerConfig(BaseSamplerConfig):
 
 @dataclass
 class LLaDA21Sampler(BaseSampler):
+    supports_nfe = True
+
     @torch.no_grad()
     def sample(
         self,
@@ -125,6 +127,7 @@ class LLaDA21Sampler(BaseSampler):
         num_to_transfer = kwargs.get("num_to_transfer", config.num_to_transfer)
         eos_early_stop = kwargs.get("eos_early_stop", config.eos_early_stop)
         return_dict = kwargs.get("return_dict", config.return_dict)
+        return_histories = kwargs.get("return_histories", return_dict)
 
         mask_id = self.tokenizer.mask_token_id
         eos_id = self.tokenizer.eos_token_id
@@ -186,7 +189,8 @@ class LLaDA21Sampler(BaseSampler):
             x[i, :prompt_len] = p
 
         prompt_blocks = prompt_len // block_size
-        histories = [x.clone()] if return_dict else None
+        histories = [x.clone()] if return_histories else None
+        nfe_count = 0
 
         for blk in range(prompt_blocks, num_blocks):
             window_end = (blk + 1) * block_size
@@ -215,6 +219,7 @@ class LLaDA21Sampler(BaseSampler):
                 if post_steps > max_post_steps:
                     break
 
+                nfe_count += 1
                 logits = self.model(
                     cur_x,
                     attention_mask=cur_attn,
@@ -279,7 +284,7 @@ class LLaDA21Sampler(BaseSampler):
 
         if not return_dict:
             return x
-        return BaseSamplerOutput(sequences=x, histories=histories)
+        return BaseSamplerOutput(sequences=x, histories=histories, nfe=[nfe_count] * B)
 
     @torch.no_grad()
     def infill(
